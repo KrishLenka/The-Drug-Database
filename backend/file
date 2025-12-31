@@ -1,0 +1,308 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, List, Any
+from pymongo import MongoClient
+import os
+import re
+from datetime import datetime
+
+app = FastAPI()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# MongoDB connection
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+DB_NAME = os.environ.get("DB_NAME", "drug_database")
+
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
+
+# Dataset configurations
+DATASET_CONFIGS = {
+    "products": {
+        "date_field": "approval_date",
+        "filter_columns": ["appl_type", "form", "route", "type", "rld", "rs"],
+        "search_fields": ["ingredient", "trade_name", "form", "route", "applicant", "type", "dosage"]
+    },
+    "exclusivity": {
+        "date_field": "exclusivity_date",
+        "filter_columns": ["appl_type", "form", "route", "exclusivity_code"],
+        "search_fields": ["ingredient", "trade_name", "form", "route", "exclusivity_code"]
+    },
+    "patent": {
+        "date_field": "submission_date",
+        "filter_columns": ["appl_type", "form", "route", "drug_substance_flag", "drug_product_flag"],
+        "search_fields": ["ingredient", "trade_name", "form", "route", "patent_no", "applicant"]
+    }
+}
+
+class SearchRequest(BaseModel):
+    textQuery: Optional[str] = None
+    filters: Optional[Dict[str, Any]] = None
+    dateRanges: Optional[Dict[str, Dict[str, str]]] = None
+    page: int = 1
+    limit: int = 50
+    sortBy: Optional[str] = None
+    sortOrder: str = "ASC"
+
+def parse_text_query(query: str, dataset: str) -> dict:
+    """Parse natural language query into MongoDB filter"""
+    if not query or not query.strip():
+        return {}
+    
+    config = DATASET_CONFIGS.get(dataset, DATASET_CONFIGS["products"])
+    date_field = config["date_field"]
+    search_fields = config["search_fields"]
+    
+    conditions = []
+    
+    # Date patterns
+    # "approved after 2020" or "approval after 2020"
+    match = re.search(r'(?:approved|approval)\s+(?:after|since|from)\s+(\d{4})', query, re.IGNORECASE)
+    if match:
+        year = match.group(1)
+        conditions.append({date_field: {"$gte": datetime(int(year), 1, 1)}})
+    
+    # "approved before 2020"
+    match = re.search(r'(?:approved|approval)\s+(?:before|until|to)\s+(\d{4})', query, re.IGNORECASE)
+    if match:
+        year = match.group(1)
+        conditions.append({date_field: {"$lte": datetime(int(year), 12, 31)}})
+    
+    # "approved in 2020"
+    match = re.search(r'(?:approved|approval)\s+(?:in|during)\s+(\d{4})', query, re.IGNORECASE)
+    if match:
+        year = match.group(1)
+        conditions.append({date_field: {"$gte": datetime(int(year), 1, 1), "$lte": datetime(int(year), 12, 31)}})
+    
+    # Include/contain patterns for ingredient with quotes
+    match = re.search(r'(?:include|includes|containing|contain|with)\s+"([^"]+)"', query, re.IGNORECASE)
+    if match:
+        conditions.append({"ingredient": {"$regex": match.group(1), "$options": "i"}})
+    else:
+        # Without quotes
+        match = re.search(r'(?:include|includes|containing|contain|with)\s+(\w+)', query, re.IGNORECASE)
+        if match:
+            conditions.append({"ingredient": {"$regex": match.group(1), "$options": "i"}})
+    
+    # Form patterns
+    match = re.search(r'(?:form|dosage\s*form)\s+(?:is|=|:)?\s*"?(\w+)"?', query, re.IGNORECASE)
+    if match:
+        conditions.append({"form": {"$regex": match.group(1), "$options": "i"}})
+    
+    # Route patterns
+    match = re.search(r'(?:route|via)\s+(?:is|=|:)?\s*"?(\w+)"?', query, re.IGNORECASE)
+    if match:
+        conditions.append({"route": {"$regex": match.group(1), "$options": "i"}})
+    
+    # Trade name patterns
+    match = re.search(r'(?:trade\s*name|brand|called)\s+(?:is|=|:)?\s*"?([^"]+)"?', query, re.IGNORECASE)
+    if match:
+        conditions.append({"trade_name": {"$regex": match.group(1).strip(), "$options": "i"}})
+    
+    # Type patterns
+    match = re.search(r'(?:type)\s+(?:is|=|:)?\s*"?(\w+)"?', query, re.IGNORECASE)
+    if match:
+        conditions.append({"type": match.group(1).upper()})
+    
+    # Application type patterns
+    match = re.search(r'(?:appl_type|application\s*type)\s+(?:is|=|:)?\s*"?(\w)"?', query, re.IGNORECASE)
+    if match:
+        conditions.append({"appl_type": match.group(1).upper()})
+    
+    # If no specific patterns matched, do general text search
+    if not conditions:
+        stop_words = ['give', 'me', 'show', 'find', 'get', 'list', 'all', 'products', 'that', 'are', 'is', 'the', 'and', 'or', 'for', 'a', 'an', 'with']
+        words = [w for w in query.split() if len(w) > 2 and w.lower() not in stop_words]
+        
+        for word in words:
+            or_conditions = [{field: {"$regex": word, "$options": "i"}} for field in search_fields]
+            if or_conditions:
+                conditions.append({"$or": or_conditions})
+    
+    if conditions:
+        return {"$and": conditions}
+    return {}
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "OK"}
+
+
+@app.get("/api/stats")
+def get_stats():
+    try:
+        return {
+            "products": db.products.count_documents({}),
+            "exclusivity": db.exclusivity.count_documents({}),
+            "patent": db.patent.count_documents({})
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/filter-options/{dataset}")
+def get_filter_options(dataset: str):
+    valid_datasets = ["products", "exclusivity", "patent"]
+    if dataset not in valid_datasets:
+        raise HTTPException(status_code=400, detail="Invalid dataset")
+    
+    try:
+        collection = db[dataset]
+        config = DATASET_CONFIGS[dataset]
+        options = {}
+        
+        for col in config["filter_columns"]:
+            values = collection.distinct(col)
+            options[col] = sorted([v for v in values if v and str(v).strip()][:100])
+        
+        return options
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/search/{dataset}")
+def search_dataset(dataset: str, request: SearchRequest):
+    valid_datasets = ["products", "exclusivity", "patent"]
+    if dataset not in valid_datasets:
+        raise HTTPException(status_code=400, detail="Invalid dataset")
+    
+    try:
+        collection = db[dataset]
+        conditions = []
+        
+        # Parse text query
+        if request.textQuery and request.textQuery.strip():
+            text_filter = parse_text_query(request.textQuery, dataset)
+            if text_filter:
+                if "$and" in text_filter:
+                    conditions.extend(text_filter["$and"])
+                else:
+                    conditions.append(text_filter)
+        
+        # Apply dropdown/multi-select filters
+        if request.filters:
+            for field, values in request.filters.items():
+                if isinstance(values, list) and values:
+                    conditions.append({field: {"$in": values}})
+                elif isinstance(values, str) and values.strip():
+                    conditions.append({field: {"$regex": values, "$options": "i"}})
+        
+        # Apply date range filters
+        if request.dateRanges:
+            for field, range_val in request.dateRanges.items():
+                date_filter = {}
+                if range_val.get("from"):
+                    date_filter["$gte"] = datetime.fromisoformat(range_val["from"].replace("Z", ""))
+                if range_val.get("to"):
+                    date_filter["$lte"] = datetime.fromisoformat(range_val["to"].replace("Z", ""))
+                if date_filter:
+                    conditions.append({field: date_filter})
+        
+        # Build final filter
+        final_filter = {"$and": conditions} if conditions else {}
+        
+        # Get total count
+        total = collection.count_documents(final_filter)
+        
+        # Build sort
+        sort_options = []
+        if request.sortBy:
+            direction = -1 if request.sortOrder.upper() == "DESC" else 1
+            sort_options.append((request.sortBy, direction))
+        
+        # Pagination
+        skip = (request.page - 1) * request.limit
+        
+        # Get data
+        cursor = collection.find(final_filter, {"_id": 0})
+        if sort_options:
+            cursor = cursor.sort(sort_options)
+        data = list(cursor.skip(skip).limit(request.limit))
+        
+        # Convert datetime objects to strings
+        for row in data:
+            for key, value in row.items():
+                if isinstance(value, datetime):
+                    row[key] = value.strftime("%Y-%m-%d")
+        
+        return {
+            "data": data,
+            "pagination": {
+                "page": request.page,
+                "limit": request.limit,
+                "total": total,
+                "totalPages": (total + request.limit - 1) // request.limit
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/schema/{dataset}")
+def get_schema(dataset: str):
+    schemas = {
+        "products": [
+            {"column_name": "appl_no", "data_type": "string"},
+            {"column_name": "appl_type", "data_type": "string"},
+            {"column_name": "ingredient", "data_type": "string"},
+            {"column_name": "dosage", "data_type": "string"},
+            {"column_name": "form", "data_type": "string"},
+            {"column_name": "route", "data_type": "string"},
+            {"column_name": "trade_name", "data_type": "string"},
+            {"column_name": "applicant", "data_type": "string"},
+            {"column_name": "strength", "data_type": "string"},
+            {"column_name": "product_no", "data_type": "string"},
+            {"column_name": "te_code", "data_type": "string"},
+            {"column_name": "approval_date", "data_type": "date"},
+            {"column_name": "rld", "data_type": "string"},
+            {"column_name": "rs", "data_type": "string"},
+            {"column_name": "type", "data_type": "string"},
+            {"column_name": "applicant_full_name", "data_type": "string"}
+        ],
+        "exclusivity": [
+            {"column_name": "appl_no", "data_type": "string"},
+            {"column_name": "appl_type", "data_type": "string"},
+            {"column_name": "ingredient", "data_type": "string"},
+            {"column_name": "dosage", "data_type": "string"},
+            {"column_name": "form", "data_type": "string"},
+            {"column_name": "route", "data_type": "string"},
+            {"column_name": "trade_name", "data_type": "string"},
+            {"column_name": "strength", "data_type": "string"},
+            {"column_name": "product_no", "data_type": "string"},
+            {"column_name": "exclusivity_code", "data_type": "string"},
+            {"column_name": "exclusivity_date", "data_type": "date"}
+        ],
+        "patent": [
+            {"column_name": "appl_no", "data_type": "string"},
+            {"column_name": "appl_type", "data_type": "string"},
+            {"column_name": "ingredient", "data_type": "string"},
+            {"column_name": "dosage", "data_type": "string"},
+            {"column_name": "form", "data_type": "string"},
+            {"column_name": "route", "data_type": "string"},
+            {"column_name": "trade_name", "data_type": "string"},
+            {"column_name": "applicant", "data_type": "string"},
+            {"column_name": "strength", "data_type": "string"},
+            {"column_name": "product_no", "data_type": "string"},
+            {"column_name": "patent_no", "data_type": "string"},
+            {"column_name": "patent_expire_date_text", "data_type": "string"},
+            {"column_name": "drug_substance_flag", "data_type": "string"},
+            {"column_name": "drug_product_flag", "data_type": "string"},
+            {"column_name": "patent_use_code", "data_type": "string"},
+            {"column_name": "submission_date", "data_type": "date"}
+        ]
+    }
+    
+    if dataset not in schemas:
+        raise HTTPException(status_code=400, detail="Invalid dataset")
+    
+    return schemas[dataset]
